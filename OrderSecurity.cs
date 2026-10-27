@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.EntityFrameworkCore;
 
 public sealed record StoredOrder(string Id, string TenantId, string OwnerSubject,
     string Status, decimal Total, string InternalNote);
@@ -11,6 +12,52 @@ public static class OrderPermissions
     public static bool HasReadScope(ClaimsPrincipal user) => user.FindAll("scope")
         .SelectMany(c => c.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries))
         .Contains("orders.read", StringComparer.Ordinal);
+}
+
+public interface ITenantContext
+{
+    string? CurrentTenant { get; }
+}
+
+public sealed class AmbientTenantContext : ITenantContext
+{
+    private static readonly AsyncLocal<string?> _current = new();
+    public static string? Current
+    {
+        get => _current.Value;
+        set => _current.Value = value;
+    }
+    public string? CurrentTenant => _current.Value;
+}
+
+public sealed class CompositeTenantContext(IHttpContextAccessor http) : ITenantContext
+{
+    public string? CurrentTenant =>
+        http.HttpContext?.User.FindFirst("tenant_id")?.Value ?? AmbientTenantContext.Current;
+}
+
+public sealed class OrdersDbContext(DbContextOptions<OrdersDbContext> options, ITenantContext tenantContext)
+    : DbContext(options)
+{
+    public DbSet<StoredOrder> Orders => Set<StoredOrder>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+        modelBuilder.Entity<StoredOrder>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.TenantId).IsRequired();
+            entity.Property(e => e.OwnerSubject).IsRequired();
+            entity.Property(e => e.Status).IsRequired();
+            entity.Property(e => e.Total).HasPrecision(18, 2);
+            entity.Property(e => e.InternalNote).IsRequired();
+
+            // Entity Framework Global Query Filter:
+            // Injects WHERE "o"."TenantId" = @tenant directly into every generated SQL statement
+            entity.HasQueryFilter(e => e.TenantId == tenantContext.CurrentTenant);
+        });
+    }
 }
 
 public sealed class Memberships
@@ -25,23 +72,36 @@ public sealed class Memberships
     public bool IsActive(string subject, string tenant) =>
         active.TryGetValue((subject, tenant), out var value) && value;
 
-    // Used by the in-process test to verify current policy after token issuance.
+    // Used by tests to verify current policy after token issuance.
     // Not exposed as an HTTP or MCP tool.
     public void Revoke(string subject, string tenant) => active[(subject, tenant)] = false;
 }
 
-public sealed class OrderStore
+public sealed class OrderStore(OrdersDbContext db)
 {
-    private static readonly StoredOrder[] Orders =
-    [
-        new("order-a-101", "tenant-a", "alice", "Ready", 49m, "A-INTERNAL-DO-NOT-RETURN"),
-        new("order-b-202", "tenant-b", "bob", "Ready", 79m, "B-INTERNAL-DO-NOT-RETURN")
-    ];
+    public async Task<StoredOrder?> FindInTenantAsync(string orderId, CancellationToken ct = default)
+    {
+        // EF Core global query filter ensures this only selects within the active tenant
+        return await db.Orders.SingleOrDefaultAsync(o => o.Id == orderId, ct);
+    }
 
-    // Tenant comes from validated identity and current membership, never arguments.
-    // A real database implementation should include this predicate in its query.
-    public StoredOrder? FindInTenant(string tenant, string orderId) =>
-        Orders.SingleOrDefault(o => o.TenantId == tenant && o.Id == orderId);
+    public string GetGeneratedQuerySql(string orderId)
+    {
+        return db.Orders.Where(o => o.Id == orderId).ToQueryString();
+    }
+
+    public async Task EnsureSeededAsync()
+    {
+        await db.Database.EnsureCreatedAsync();
+        if (!await db.Orders.IgnoreQueryFilters().AnyAsync())
+        {
+            db.Orders.AddRange(
+                new StoredOrder("order-a-101", "tenant-a", "alice", "Ready", 49m, "A-INTERNAL-DO-NOT-RETURN"),
+                new StoredOrder("order-b-202", "tenant-b", "bob", "Ready", 79m, "B-INTERNAL-DO-NOT-RETURN")
+            );
+            await db.SaveChangesAsync();
+        }
+    }
 }
 
 public sealed class ReadOrderRequirement : IAuthorizationRequirement
@@ -102,7 +162,7 @@ public sealed class OrderService(OrderStore store, Memberships memberships,
             return null;
         }
 
-        var order = store.FindInTenant(tenant, orderId);
+        var order = await store.FindInTenantAsync(orderId, cancellationToken);
         if (order is null)
         {
             audit.Record(user, false);

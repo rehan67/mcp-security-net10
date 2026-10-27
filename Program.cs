@@ -2,15 +2,14 @@ using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using ModelContextProtocol.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
-// This JWT-only disposable lab does not need a persistent cookie-protection key ring.
 builder.Services.AddDataProtection().UseEphemeralDataProtectionProvider();
 
-// This educational host intentionally runs only on loopback in Development.
-// Its local signed tokens are test credentials, not a full OAuth server.
 if (!builder.Environment.IsDevelopment())
     throw new InvalidOperationException("Run this synthetic lab in Development only.");
 var listen = builder.Configuration["urls"] ?? "http://127.0.0.1:7047";
@@ -46,29 +45,39 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             NameClaimType = "sub"
         };
     });
+
 builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("orders.read", policy => policy
         .RequireAuthenticatedUser()
         .RequireAssertion(ctx => OrderPermissions.HasReadScope(ctx.User)));
 });
+
+// Configure In-Memory SQLite Database with Shared Cache
+// Master connection stays open to keep the shared in-memory database alive
+var masterConnection = new SqliteConnection("Data Source=OrdersLab;Mode=Memory;Cache=Shared");
+masterConnection.Open();
+builder.Services.AddSingleton(masterConnection);
+builder.Services.AddDbContext<OrdersDbContext>((sp, opt) =>
+{
+    opt.UseSqlite("Data Source=OrdersLab;Mode=Memory;Cache=Shared");
+});
+
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<ITenantContext, CompositeTenantContext>();
 builder.Services.AddSingleton<IAuthorizationHandler, OrderReadHandler>();
 builder.Services.AddSingleton<Memberships>();
-builder.Services.AddSingleton<OrderStore>();
 builder.Services.AddSingleton<DecisionAudit>();
+builder.Services.AddScoped<OrderStore>();
 builder.Services.AddScoped<OrderService>();
-builder.Services.AddHttpContextAccessor();
+
 builder.Services.AddMcpServer()
     .WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless)
     .AddAuthorizationFilters()
     .WithTools<OrderTools>();
 
 var app = builder.Build();
-if (builder.Configuration.GetValue<bool>("self-test"))
-{
-    await PolicySelfTests.RunAsync(app.Services);
-    return;
-}
+
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapGet("/health", () => Results.Ok(new { status = "synthetic-local-lab" }));
@@ -82,5 +91,17 @@ app.MapGet("/orders/{orderId}", async (string orderId, HttpContext http,
     return result is null ? Results.NotFound() : Results.Ok(result);
 }).RequireAuthorization("orders.read");
 
-// There is no unsecured token minting, membership admin, SQL or shell endpoint.
+// Seed initial test data into SQLite
+using (var scope = app.Services.CreateScope())
+{
+    var store = scope.ServiceProvider.GetRequiredService<OrderStore>();
+    await store.EnsureSeededAsync();
+}
+
+if (builder.Configuration.GetValue<bool>("self-test"))
+{
+    await PolicySelfTests.RunAsync(app, listen, signingKey, issuer, audience);
+    return;
+}
+
 app.Run();

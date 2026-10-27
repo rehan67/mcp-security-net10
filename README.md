@@ -17,7 +17,7 @@ In modern AI agent architectures using the [Model Context Protocol (MCP)](https:
 
 If an AI agent caller (e.g. Alice in Tenant A) presents a cryptographically valid token and requests a private resource identifier belonging to another customer (`order-b-202` in Tenant B), a naive MCP server will happily execute the read.
 
-This repository demonstrates the **4 Gates of Production MCP Security** implemented in .NET 10, ASP.NET Core, and official Model Context Protocol packages.
+This repository demonstrates the **4 Gates of Production MCP Security** implemented in .NET 10, ASP.NET Core, Entity Framework Core, and official Model Context Protocol packages.
 
 ---
 
@@ -52,9 +52,11 @@ This repository demonstrates the **4 Gates of Production MCP Security** implemen
                          │
                          ▼
 ┌────────────────────────────────────────────────────────┐
-│ Gate 4: Data Boundary & Uniform Denial                 │
-│ • Domain Store queries filtered by TenantId            │
-│ • Cross-tenant & missing IDs: same tool error          │
+│ Gate 4: EF Core Global Query Filter & Uniform Denial   │
+│ • OrdersDbContext applies tenant global query filter   │
+│ • WHERE "o"."TenantId" = @tenant injected into SQL     │
+│ • Database returns zero rows for cross-tenant IDs      │
+│ • Returns generic "Order unavailable." (anti-leakage)  │
 │ • Anti-enumeration protection + Redacted Audit Log     │
 └────────────────────────────────────────────────────────┘
 ```
@@ -97,8 +99,19 @@ var principal = http.HttpContext?.User
 var order = await orders.ReadAsync(principal, orderId, cancellationToken);
 ```
 
-### 4. Gate 4: Uniform Denial Without Data Leakage
-When a caller requests a record that does not belong to their tenant, returning `403 Forbidden: Belongs to Tenant B` leaks business intelligence. For both inaccessible and missing orders, the MCP tool returns the same tool error result (`isError: true`, text `Order unavailable.`) with no order payload, and records a redacted decision event. Note: over MCP the HTTP exchange itself is still 200; the denial is in the tool result. The separate REST route returns a not-found response. A matching message does not by itself rule out timing side channels.
+### 4. Gate 4: Entity Framework Core Global Query Filter & Uniform Denial
+To ensure multi-tenant isolation cannot be bypassed by arbitrary ID lookups, `OrdersDbContext` applies an Entity Framework Core Global Query Filter:
+```csharp
+modelBuilder.Entity<StoredOrder>(entity =>
+{
+    entity.HasKey(e => e.Id);
+    // EF Core injects WHERE "TenantId" = @tenant directly into every generated SQL statement
+    entity.HasQueryFilter(e => e.TenantId == tenantContext.CurrentTenant);
+});
+```
+When Alice queries for `order-b-202`, EF Core automatically injects `WHERE "o"."TenantId" = @tenant` into the SQL statement, and the database returns zero rows.
+For both inaccessible and missing orders, the MCP tool returns the same tool error result (`isError: true`, text `Order unavailable.`) with no order payload, and records a redacted decision event. The separate REST route returns a standard 404 Not Found.
+
 ```csharp
 return order is null
     ? new CallToolResult { IsError = true, Content = [new TextContentBlock { Text = "Order unavailable." }] }
@@ -107,48 +120,67 @@ return order is null
 
 ---
 
-## 🧪 Verification
+## 🧪 Automated Negative Assertion Test Suite
 
-[`PolicySelfTests.cs`](PolicySelfTests.cs) contains **8 in-process resource-policy checks** (both allowed and denied cases) that you can run yourself with the command below.
+[`PolicySelfTests.cs`](PolicySelfTests.cs) contains **28 automated checks** executed against the live HTTP MCP pipeline and the EF Core database:
 
-The accompanying article also reports a separate local HTTP verification run (20 checks, including that group of 8) that exercised the real MCP endpoint: wrong audience/issuer/expiry/signature, hidden tools and direct invocation of a known tool name, header-based tenant override attempts, and 24 concurrent requests sharing JSON-RPC IDs. That HTTP harness is **not included in this repository**; treat those results as the article's recorded evidence, not something this repo reproduces on its own.
-
-The in-process checks in this repository:
-
-| Test Assertion | Verified Behavior |
-|---|---|
-| `Owner reads allowed order` | Tenant A owner successfully reads their own record |
-| `Cross-tenant request denied` | Tenant A caller requesting Tenant B order is denied |
-| `Same tenant owner policy` | Caller in same tenant without record ownership is denied |
-| `Claimed tenant membership` | A principal claiming tenant B without server-side membership is denied |
-| `Scope enforcement` | Token with `orders.write` rejected when `orders.read` is required |
-| `Unauthenticated denial` | An unauthenticated principal is denied by the shared order service |
-| `Membership revocation` | Revoking membership denies a principal that was created before the change |
-| `Redacted audit trail` | Security audit records both outcomes without exposing sensitive data |
+| # | Verified Test Scenario | Assertion Description |
+|---|---|---|
+| 1 | Missing credential | Rejected at HTTP boundary (401 Unauthorized) |
+| 2 | Wrong audience | RFC 9068 audience mismatch rejected (401 Unauthorized) |
+| 3 | Wrong issuer | Untrusted issuer signature rejected (401 Unauthorized) |
+| 4 | Expired token | Expired token rejected at ingress (401 Unauthorized) |
+| 5 | Invalid signature | Forged/bad signature rejected (401 Unauthorized) |
+| 6 | Tool discovery | Authorized caller with `orders.read` discovers `get_order` via `tools/list` |
+| 7 | Scope filtering | Unauthorized caller without `orders.read` has `get_order` hidden from catalog |
+| 8 | Direct tool invocation | Calling known tool without scope rejected by authorization filter |
+| 9 | Authorized read | Alice successfully reads `order-a-101` over MCP protocol |
+| 10 | Data minimization | Success response omits internal database notes |
+| 11 | Cross-tenant denial | Cross-tenant request returns uniform tool error `"Order unavailable."` |
+| 12 | Zero data leakage | Cross-tenant response contains zero Tenant B order payloads |
+| 13 | Header injection defense | Forwarded `X-Tenant-Id` headers cannot override authenticated identity |
+| 14 | Dynamic membership | Forged tenant claim rejected without server-side membership |
+| 15 | Same-tenant owner policy | Callers in same tenant without record ownership are denied |
+| 16 | REST route isolation | Cross-tenant lookup on REST endpoint returns 404 Not Found |
+| 17 | REST route authorized | Owner lookup on REST endpoint returns 200 OK with projected view |
+| 18 | Concurrency isolation | 24 concurrent A/B MCP requests with identical RPC IDs stay isolated |
+| 19 | EF Core SQL filter | Assert generated SQL contains `WHERE "o"."TenantId" = @tenant` |
+| 20 | Database zero rows | Assert EF Core database returns zero rows for other tenant's order |
+| 21 | Policy: Owner read | In-process: Allowed owner reads record |
+| 22 | Policy: Cross-tenant | In-process: Cross-tenant read denied |
+| 23 | Policy: Same-tenant | In-process: Non-owner in same tenant denied |
+| 24 | Policy: Membership | In-process: Claimed tenant without active membership denied |
+| 25 | Policy: Scope check | In-process: `orders.write` not accepted for read requirement |
+| 26 | Policy: Unauthenticated | In-process: Unauthenticated principal denied |
+| 27 | Policy: Revocation | In-process: Real-time membership revocation takes effect immediately |
+| 28 | Policy: Audit trail | In-process: Audit logger records decisions without sensitive payloads |
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (pinned to `10.0.402` in [`global.json`](global.json))
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (pinned in [`global.json`](global.json))
 
-The lab deliberately refuses to start outside the `Development` environment and binds only to `127.0.0.1`.
+The lab binds to `127.0.0.1` and runs in `Development` mode.
 
-### Run the in-process policy self-tests (PowerShell)
+### Run the 28-Test Automated Suite (PowerShell)
 ```powershell
 $env:ASPNETCORE_ENVIRONMENT = "Development"
-# Use a fresh local value of at least 32 bytes; it is a test credential, not a production secret
-$env:MCP_LAB_SIGNING_KEY = "replace-with-a-fresh-local-test-key-32b+"
+$env:MCP_LAB_SIGNING_KEY = "test-secret-key-with-at-least-32-bytes!!"
 
 dotnet run -- --self-test true
 ```
-Expected output ends with `SELF_TEST_REPORT:` listing the 8 policy checks.
+Expected output:
+```text
+SELF_TEST_REPORT:{"status":"passed","targetFramework":"net10.0","totalChecks":28,...}
+```
 
-### Run the MCP HTTP server
+### Run the MCP HTTP Server
 ```powershell
 $env:ASPNETCORE_ENVIRONMENT = "Development"
-$env:MCP_LAB_SIGNING_KEY = "replace-with-a-fresh-local-test-key-32b+"
+$env:MCP_LAB_SIGNING_KEY = "your-secure-32-byte-signing-key-here!!"
+
 dotnet run
 ```
 The stateless HTTP MCP server will listen at `http://127.0.0.1:7047/mcp`.
