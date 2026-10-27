@@ -30,7 +30,7 @@ This repository demonstrates the **4 Gates of Production MCP Security** implemen
          ▼
 ┌────────────────────────────────────────────────────────┐
 │ Gate 1: Audience & Ingress Verification                │
-│ • Validates RFC 9068 §2.2 Token Audience               │
+│ • Validates JWT audience (RFC 9068 profile)            │
 │ • Rejects cross-API token replay (aud == /mcp)         │
 └────────────────────────┬───────────────────────────────┘
                          │
@@ -52,9 +52,9 @@ This repository demonstrates the **4 Gates of Production MCP Security** implemen
                          │
                          ▼
 ┌────────────────────────────────────────────────────────┐
-│ Gate 4: Data Boundary & Generic 404 Denial             │
+│ Gate 4: Data Boundary & Uniform Denial                 │
 │ • Domain Store queries filtered by TenantId            │
-│ • Cross-tenant and missing IDs both return 404         │
+│ • Cross-tenant & missing IDs: same tool error          │
 │ • Anti-enumeration protection + Redacted Audit Log     │
 └────────────────────────────────────────────────────────┘
 ```
@@ -63,7 +63,7 @@ This repository demonstrates the **4 Gates of Production MCP Security** implemen
 
 ## 🛡️ The 4 Defense Gates Explained
 
-### 1. Gate 1: Token Audience & Ingress (RFC 9068 §2.2)
+### 1. Gate 1: Token Audience & Ingress (RFC 9068 profile)
 A token issued for a general customer portal or administrative service must never be accepted by an internal MCP server. We strictly enforce that the JWT audience matches the dedicated MCP tool endpoint:
 ```csharp
 options.TokenValidationParameters = new TokenValidationParameters
@@ -97,8 +97,8 @@ var principal = http.HttpContext?.User
 var order = await orders.ReadAsync(principal, orderId, cancellationToken);
 ```
 
-### 4. Gate 4: Generic 404 Denial & Anti-Enumeration
-When a caller requests a record that does not belong to their tenant, returning `403 Forbidden: Belongs to Tenant B` leaks business intelligence. Our domain service returns a clean, generic `Order unavailable.` (404) while recording a redacted decision event for security triage:
+### 4. Gate 4: Uniform Denial Without Data Leakage
+When a caller requests a record that does not belong to their tenant, returning `403 Forbidden: Belongs to Tenant B` leaks business intelligence. For both inaccessible and missing orders, the MCP tool returns the same tool error result (`isError: true`, text `Order unavailable.`) with no order payload, and records a redacted decision event. Note: over MCP the HTTP exchange itself is still 200; the denial is in the tool result. The separate REST route returns a not-found response. A matching message does not by itself rule out timing side channels.
 ```csharp
 return order is null
     ? new CallToolResult { IsError = true, Content = [new TextContentBlock { Text = "Order unavailable." }] }
@@ -107,19 +107,23 @@ return order is null
 
 ---
 
-## 🧪 Automated Negative Assertion Test Suite
+## 🧪 Verification
 
-Production security boundaries must be proven with automated negative tests. [`PolicySelfTests.cs`](PolicySelfTests.cs) runs **28 automated assertions** against the running HTTP MCP pipeline:
+[`PolicySelfTests.cs`](PolicySelfTests.cs) contains **8 in-process resource-policy checks** (both allowed and denied cases) that you can run yourself with the command below.
+
+The accompanying article also reports a separate local HTTP verification run (20 checks, including that group of 8) that exercised the real MCP endpoint: wrong audience/issuer/expiry/signature, hidden tools and direct invocation of a known tool name, header-based tenant override attempts, and 24 concurrent requests sharing JSON-RPC IDs. That HTTP harness is **not included in this repository**; treat those results as the article's recorded evidence, not something this repo reproduces on its own.
+
+The in-process checks in this repository:
 
 | Test Assertion | Verified Behavior |
 |---|---|
 | `Owner reads allowed order` | Tenant A owner successfully reads their own record |
 | `Cross-tenant request denied` | Tenant A caller requesting Tenant B order is denied |
 | `Same tenant owner policy` | Caller in same tenant without record ownership is denied |
-| `Claimed tenant membership` | Token with forged tenant claim fails dynamic membership verification |
+| `Claimed tenant membership` | A principal claiming tenant B without server-side membership is denied |
 | `Scope enforcement` | Token with `orders.write` rejected when `orders.read` is required |
-| `Unauthenticated denial` | Calls missing authorization headers rejected immediately |
-| `Membership revocation` | Mid-session revocation revokes access on existing tokens |
+| `Unauthenticated denial` | An unauthenticated principal is denied by the shared order service |
+| `Membership revocation` | Revoking membership denies a principal that was created before the change |
 | `Redacted audit trail` | Security audit records both outcomes without exposing sensitive data |
 
 ---
@@ -129,18 +133,22 @@ Production security boundaries must be proven with automated negative tests. [`P
 ### Prerequisites
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (pinned to `10.0.402` in [`global.json`](global.json))
 
-### Run the Automated Self-Test Suite
-```bash
-# Set a temporary HMAC signing key for the local test run
-$env:MCP_LAB_SIGNING_KEY = "test-secret-key-with-at-least-32-bytes!!"
+The lab deliberately refuses to start outside the `Development` environment and binds only to `127.0.0.1`.
 
-# Execute in-process policy and isolation self-tests
-dotnet run -- --self-test
+### Run the in-process policy self-tests (PowerShell)
+```powershell
+$env:ASPNETCORE_ENVIRONMENT = "Development"
+# Use a fresh local value of at least 32 bytes; it is a test credential, not a production secret
+$env:MCP_LAB_SIGNING_KEY = "replace-with-a-fresh-local-test-key-32b+"
+
+dotnet run -- --self-test true
 ```
+Expected output ends with `SELF_TEST_REPORT:` listing the 8 policy checks.
 
-### Run the MCP HTTP Server
-```bash
-$env:MCP_LAB_SIGNING_KEY = "your-secure-32-byte-signing-key-here!!"
+### Run the MCP HTTP server
+```powershell
+$env:ASPNETCORE_ENVIRONMENT = "Development"
+$env:MCP_LAB_SIGNING_KEY = "replace-with-a-fresh-local-test-key-32b+"
 dotnet run
 ```
 The stateless HTTP MCP server will listen at `http://127.0.0.1:7047/mcp`.
